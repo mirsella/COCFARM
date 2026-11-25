@@ -1345,18 +1345,29 @@ def place_first(game: Game, slot: Slot, start: tuple[int, int], centre: tuple[in
     return None
 
 
-def deploy_stage(game: Game, cfg: BuilderConfig, first: bool = False) -> tuple[float, list[Slot]]:
+def deploy_stage(game: Game, cfg: BuilderConfig, first: bool = False,
+                 *, drop: tuple[tuple[int, int], tuple[int, int]] | None = None,
+                 observe: Callable[[Game], None] | None = None) -> tuple[float, list[Slot]]:
     """Hero at the far corner, then (``troop_delay`` s later) every ready
     troop there too. Returns when the hero landed and the troops sent.
     On the ``first`` base, the hero is set to ``cfg.first_hero`` first."""
+    def observed(screen: np.ndarray) -> np.ndarray:
+        if observe is not None:
+            observe(game)
+        return screen
+
     if first:
         game.look_around()  # "Look around before deploying"
     game.zoom_out(quick=True)  # each stage opens at the game's default zoom
     if first and cfg.use_hero and cfg.first_hero in HEROES:
         choose_hero(game, cfg, cfg.first_hero)
-    screen = game.refresh()
-    side, point = pick_corner(screen, cfg)
-    centre = base_centre(screen)
+    screen = observed(game.refresh())
+    if drop is None:
+        side, point = pick_corner(screen, cfg)
+        centre = base_centre(screen)
+    else:
+        side = "phone's left edge"
+        point, centre = drop
     troops = ready_troops(screen, cfg)
     log.info("Stage: hero and %d troop card(s) from the %s corner", len(troops), side)
     hero = Slot(0, cfg.hero_x)
@@ -1365,10 +1376,10 @@ def deploy_stage(game: Game, cfg: BuilderConfig, first: bool = False) -> tuple[f
         if health is not None and health < cfg.switch_below:
             log.info("Hero health %d%%, below %d%%: switching hero", health * 100, cfg.switch_below * 100)
             if switch_hero(game, cfg):
-                screen = game.refresh()
+                screen = observed(game.refresh())
     landed = game.clock()
     if cfg.use_hero and not hero_out(screen, cfg):
-        found = place_first(game, hero, point, centre, lambda s: hero_out(s, cfg), cfg)
+        found = place_first(game, hero, point, centre, lambda s: hero_out(observed(s), cfg), cfg)
         if found is None:
             log.warning("The hero couldn't be placed")
         else:
@@ -1378,10 +1389,11 @@ def deploy_stage(game: Game, cfg: BuilderConfig, first: bool = False) -> tuple[f
     elif troops:
         # No hero to find a good spot with: the first troop does it.
         first = troops[0]
-        found = place_first(game, first, point, centre, lambda s: card_state(s, first.x, cfg) != "ready", cfg)
+        found = place_first(game, first, point, centre,
+                            lambda s: card_state(observed(s), first.x, cfg) != "ready", cfg)
         if found is not None:
             point = found
-        troops = ready_troops(game.refresh(), cfg)
+        troops = ready_troops(observed(game.refresh()), cfg)
     sent: list[Slot] = []
     for _ in range(2):  # a second pass for cards whose tap was dropped
         if not troops:
@@ -1397,7 +1409,7 @@ def deploy_stage(game: Game, cfg: BuilderConfig, first: bool = False) -> tuple[f
         sent += troops
         game.wait(0.5)
         tried = len(troops)
-        troops = ready_troops(game.refresh(), cfg)
+        troops = ready_troops(observed(game.refresh()), cfg)
         if not troops:
             break
         log.info("%d troop card(s) didn't go out; trying again", len(troops))
@@ -1446,13 +1458,16 @@ def end_battle(game: Game) -> bool:
     return game.wait_for(T.BB_RETURN_HOME, timeout=15) is not None
 
 
-def _finish(game: Game, stages: int) -> BattleResult:
+def _finish(game: Game, stages: int, button: Match | None = None) -> BattleResult:
     """Keep the result screen, then Return Home."""
     from farmbot.tasks.attack import look_at_result
 
     result = BattleResult(stages, None if game.screen is None else game.screen.copy())
     look_at_result(game)
-    game.click(T.BB_RETURN_HOME)
+    if button is None:
+        game.click(T.BB_RETURN_HOME)
+    else:
+        game.tap_match(button)
     if game.wait_for(T.BB_BATTLE, timeout=15):
         if getattr(game, "note_wanted", False):  # a Clan Games challenge's note (it shows a few seconds)
             from farmbot.tasks import clan_games
@@ -1484,12 +1499,23 @@ def attack(game: Game, cfg: BuilderConfig, on_stage: Callable[[int], None] | Non
     """One builder battle, every stage, back to the builder base.
     ``on_stage`` hears each base as it begins (1, 2)."""
     start_battle(game)
+    return fight(game, cfg, on_stage)
+
+
+def fight(game: Game, cfg: BuilderConfig, on_stage: Callable[[int], None] | None = None,
+          *, deploy: Callable[..., tuple[float, list[Slot]]] = deploy_stage,
+          stage_started: Callable[[Game], bool] | None = None,
+          return_button: Callable[[Game], Match | None] | None = None) -> BattleResult:
+    """Play a matched Builder Battle through to the result and tap Return Home."""
+    def result_button() -> Match | None:
+        return game.find(T.BB_RETURN_HOME) if return_button is None else return_button(game)
+
     stages = 0
     started = game.clock()
     while stages < MAX_STAGES:
         if on_stage:
             on_stage(stages + 1)
-        landed, troops = deploy_stage(game, cfg, first=stages == 0)
+        landed, troops = deploy(game, cfg, first=stages == 0)
         stages += 1
         batches = [troops[i:i + cfg.ability_batch] for i in range(0, len(troops), max(cfg.ability_batch, 1))]
         next_batch = game.clock() + _later(game, cfg.ability_delay)
@@ -1517,10 +1543,14 @@ def attack(game: Game, cfg: BuilderConfig, on_stage: Callable[[int], None] | Non
                     log.info("Hero ability (%s)", f"{charges} bars charged" if charges_seen else "after the time set")
             if cfg.speed_up and game.has(T.BB_SPEED) and game.click(T.BB_SPEED):
                 log.info("Battle speed: 4x")
-            if game.find(T.BB_RETURN_HOME):
+            if (button := result_button()) is not None:
                 log.info("Builder battle over after %d stage(s)", stages)
-                return _finish(game, stages)
-            if now - landed > 5 and stage_reset(game):
+                return _finish(game, stages, button if return_button is not None else None)
+            # The desktop matcher needs a time gate. A custom phase tracker
+            # must see every poll, including combat immediately after landing.
+            next_stage = (stage_started(game) if stage_started is not None
+                          else now - landed > 5 and stage_reset(game))
+            if next_stage:
                 if not cfg.second_base and end_battle(game):
                     log.info("First base down: ending the battle there (Attack the second base too is off)")
                     return _finish(game, stages)
@@ -1532,6 +1562,12 @@ def attack(game: Game, cfg: BuilderConfig, on_stage: Callable[[int], None] | Non
         if not new_stage:
             break
     # Time's up (or something unexpected): wait for the result, then go home.
-    if game.wait_for(T.BB_RETURN_HOME, timeout=90, interval=2):
-        return _finish(game, stages)
+    deadline = game.clock() + 90
+    while True:
+        game.refresh()
+        if (button := result_button()) is not None:
+            return _finish(game, stages, button if return_button is not None else None)
+        if game.clock() >= deadline:
+            break
+        game.wait(2, exact=True)
     raise BuilderError("builder battle result never showed")

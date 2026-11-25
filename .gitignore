@@ -16,8 +16,9 @@ logs/
 update.json
 _update/
 
-# Not published: tests, docs, third-party samples
-tests/
+# Not published: private tests, docs, third-party samples
+/tests/*
+!/tests/test_marble.py
 docs/
 samples/
 farmbot.log

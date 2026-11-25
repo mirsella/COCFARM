@@ -1,0 +1,9 @@
+<resources>
+    <style name="MarbleTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101510</item>
+        <item name="android:colorAccent">#D9F774</item>
+        <item name="android:statusBarColor">#101510</item>
+        <item name="android:navigationBarColor">#101510</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

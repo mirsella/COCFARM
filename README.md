@@ -18,6 +18,11 @@ looks after your village, in **both the home village and the builder base**.
 > Supercell's Terms of Service, and Supercell bans accounts it catches,
 > temporarily or for good. Only use it on an account you're willing to lose.
 
+On a rooted Android phone codenamed `marble`, [Marble Runner](android/README.md)
+is a standalone APK with a Builder Base overlay. The optional
+[USB runner](android/README.md#run-from-a-computer-over-usb) does the image
+processing on your computer while the game runs on the phone.
+
 ![The COCFARM Dashboard](readme/dashboard.png)
 
 ## What it does
