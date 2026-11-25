@@ -7,29 +7,48 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.cocfarm.marble.BattleScore.Entry;
+import org.cocfarm.marble.BattleScore.Journal;
+import org.cocfarm.marble.BattleScore.Plan;
 import org.cocfarm.marble.StorageMeter.Goal;
 
 /** One fresh board and at most one input per step. No Android/UI dependencies. */
 final class BuilderRun {
     enum Mode { BATTLES, CART }
-    enum Overcharge { GAME, LOW_HP, NEAR_TARGETS }
-    enum ChargeCue { WAIT, NEAR_TARGETS, LOW_HP }
+    enum Overcharge {
+        GAME("Game"), HALF_HP("50% HP"),
+        // Kept for reading existing battle history, not valid run settings.
+        LOW_HP("Low HP (old)"), NEAR_TARGETS("Nearby (old)");
+
+        final String label;
+        Overcharge(String label) { this.label = label; }
+
+        static Overcharge fromPreference(String stored, boolean legacyEnabled) {
+            return switch (stored) {
+                case "HALF_HP", "LOW_HP", "NEAR_TARGETS" -> HALF_HP;
+                case "GAME" -> GAME;
+                default -> legacyEnabled ? HALF_HP : GAME;
+            };
+        }
+    }
     enum HeroCard { UNKNOWN, READY, DEPLOYED }
     enum HeroPower { UNKNOWN, CHARGING, READY }
     enum Strategy {
-        FOCUS("Focus"), SPLIT("Split"), COMPARE("A/B");
+        FOCUS("Focus"), SPLIT("Split"), COMPARE("Compare");
 
         final String label;
 
         Strategy(String label) { this.label = label; }
     }
-    enum Mark { BASE, FIND, ATTACK_COOLDOWN, STARTS, ENDS, RETURN, CART_WORLD, CART_TITLE, COLLECT, CART_CLOSE }
-    private enum Phase { READY, MENU, SEARCH, DEPLOY, WATCH, RETURNING, CART_FIND, CART_OPEN, CART_VERIFY,
-        CART_CLOSE, CART_RETURN }
+    enum Mark { BASE, FIND, ATTACK_COOLDOWN, STARTS, ENDS, ATTACKER, DEFENDER, SPEED_1X, RETURN,
+        CART_WORLD, CART_TITLE, COLLECT, CART_CLOSE }
+    private enum Phase { READY, MENU, SEARCH, DEPLOY, WATCH, RESULT_PENDING, RESULT, RETURNING, CART_FIND,
+        CART_OPEN, CART_VERIFY, CART_CLOSE, CART_RETURN }
 
     private static final int CART_PANS = 5;
     private static final long MENU_WAIT = 8_000;
     private static final long MAX_ATTACK_COOLDOWN = 120_000;
+    private static final long RESULT_SETTLE = 2_500;
     private static final int HERO_DROPS = 6;
     static final int STORAGE_BATTLE_CAP = 100;
 
@@ -41,9 +60,8 @@ final class BuilderRun {
                     || (storageGoal != Goal.BATTLE_LIMIT && cartEvery == 0)) {
                 throw new IllegalArgumentException("Run settings out of range");
             }
-            if (mode == Mode.BATTLES && !verify && storageGoal == Goal.BATTLE_LIMIT
-                    && strategy == Strategy.COMPARE && limit % 2 != 0) {
-                throw new IllegalArgumentException("A/B requires an even battle limit");
+            if (overcharge != Overcharge.GAME && overcharge != Overcharge.HALF_HP) {
+                throw new IllegalArgumentException("Choose GAME or HALF_HP for Overcharge.");
             }
         }
 
@@ -54,16 +72,30 @@ final class BuilderRun {
         Options(Mode mode, int limit, boolean secondStage, boolean hero, int cardOffset, boolean verify,
                 Strategy strategy, boolean overcharge) {
             this(mode, limit, secondStage, hero, cardOffset, verify, strategy,
-                    overcharge ? Overcharge.LOW_HP : Overcharge.GAME, 0, Goal.BATTLE_LIMIT);
+                    overcharge ? Overcharge.HALF_HP : Overcharge.GAME, 0, Goal.BATTLE_LIMIT);
         }
 
         boolean hasStorageGoal() { return storageGoal != Goal.BATTLE_LIMIT; }
         int cap() { return hasStorageGoal() ? STORAGE_BATTLE_CAP : limit; }
+        BattleScore.Profile profile() { return new BattleScore.Profile(hero, secondStage, cardOffset); }
+
+        Options forSession(Mode sessionMode, boolean readOnly) {
+            return new Options(sessionMode, limit, secondStage, hero, cardOffset, readOnly,
+                    strategy, overcharge, cartEvery, storageGoal);
+        }
     }
 
     record Point(int x, int y) {}
     record Match(Point point, double score) {}
-    record Status(String text, boolean finished, long delayMs) {}
+    enum PekkaHealth { UNKNOWN, ABOVE_HALF, AT_OR_BELOW_HALF }
+    record Status(String text, boolean finished, long delayMs, boolean goalReached) {
+        Status(String text, boolean finished, long delayMs) { this(text, finished, delayMs, false); }
+    }
+    static final class ScreenUnavailable extends IOException {
+        ScreenUnavailable(String message) { super(message); }
+    }
+    record Diagnostic(String phase, int battle, int stage, Plan plan, Point selected, Point attempted,
+                      Point drop, List<Point> deployed, int heroMisses, boolean heroRecovery, int lane) {}
 
     interface Board {
         Match find(Mark mark);
@@ -72,14 +104,16 @@ final class BuilderRun {
         default HeroCard heroCard() { return HeroCard.UNKNOWN; }
         default HeroPower heroPower(Point card) { return HeroPower.UNKNOWN; }
         Point dropPoint(int lane, int miss) throws IOException;
-        default ChargeCue overchargeCue(Point card) throws IOException { return ChargeCue.WAIT; }
-        default BattleScore.Result result() { return BattleScore.Result.UNREAD; }
+        default PekkaHealth pekkaHealth(Point card) { return PekkaHealth.UNKNOWN; }
+        default BattleScore.Result result() throws IOException { return BattleScore.Result.UNREAD; }
         default StorageMeter.Levels storage() throws IOException { return null; }
         void tap(Point point) throws IOException;
         void panForCart(boolean towardShore) throws IOException;
     }
 
-    final Options options;
+    private Options options;
+    private Options requested;
+    private final Journal journal;
     private Phase phase = Phase.READY;
     private long deadline;
     private long readyUntil;
@@ -90,12 +124,18 @@ final class BuilderRun {
     private long storageDeadline;
     private long cooldownLimit;
     private boolean sawEnds;
+    private boolean recheck;
+    private boolean partial;
+    private boolean speedTapped;
     private final Map<Point, Long> deployed = new HashMap<>();
     private final Set<Point> charged = new HashSet<>();
-    private final Set<Point> nearbyLastFrame = new HashSet<>();
     private final Point[] workingPlaces = new Point[2];
-    private final BattleScore scores = new BattleScore();
-    private BattleScore.Result pendingScore;
+    private Plan plan;
+    private long battleStarted;
+    private long resultSeen;
+    private int healthTriggered;
+    private int heroPowers;
+    private int splitFallbacks;
     private Point selected;
     private Point attempted;
     private Point place;
@@ -107,20 +147,46 @@ final class BuilderRun {
     private int lane;
     private int misses;
 
-    BuilderRun(Options options) { this.options = options; }
+    BuilderRun(Options options, Journal journal) {
+        this.options = requested = options;
+        this.journal = journal;
+    }
+
+    Options applySettings(Options edited) {
+        if (!options.verify) {
+            requested = edited.forSession(options.mode, false);
+            if (phase == Phase.READY) useRequestedSettings();
+        }
+        return options;
+    }
+
+    private void useRequestedSettings() {
+        if (options.storageGoal != requested.storageGoal) storageDeadline = 0;
+        options = requested;
+    }
 
     void resume() {
-        // A user might have changed the selection while paused. Never resume with a map tap.
-        selected = null;
-        nearbyLastFrame.clear();
+        recheck = true;
+    }
+
+    Diagnostic diagnostic() {
+        return new Diagnostic(phase.name(), completed + 1, stage, plan, selected, attempted, place,
+                List.copyOf(deployed.keySet()), heroMisses, lateHero, lane);
     }
 
     Status step(Board board, long now) throws IOException {
+        if (recheck) {
+            Status status = recheckScreen(board, now);
+            recheck = false;
+            if (status != null) return status;
+        }
         return switch (phase) {
             case READY -> begin(board, now);
             case MENU -> menu(board, now);
             case SEARCH -> search(board, now);
             case DEPLOY, WATCH -> battle(board, now);
+            case RESULT_PENDING -> readResult(board, now);
+            case RESULT -> leaveResult(board, now);
             case RETURNING -> returnToBase(board, now);
             case CART_FIND -> findCart(board, now);
             case CART_OPEN -> openCart(board, now);
@@ -132,14 +198,24 @@ final class BuilderRun {
 
     private Status begin(Board board, long now) throws IOException {
         if (options.mode == Mode.CART) return findCart(board, now);
-        Match base = need(board.find(Mark.BASE), "Open Builder Base and dismiss any dialogs.");
+        Match base = board.find(Mark.BASE);
+        if (base == null) {
+            Mark live = liveBanner(board);
+            if (live == null) throw new ScreenUnavailable("Open Builder Base or an active Builder Battle.");
+            if (options.verify) return done("Live Builder Battle recognized. No game input sent.");
+            startPlan();
+            partial = true;
+            battleStarted = now;
+            enterStage(0, live, now);
+            return running("Taking over the current Builder Battle");
+        }
         if (options.verify && !options.hasStorageGoal()) return done("Builder Base recognized. No taps sent.");
         if (!options.verify && cartDue()) {
             cartPans = 0;
             phase = Phase.CART_FIND;
             return findCart(board, now);
         }
-        if (completed == options.cap()) return finishBattles(options.hasStorageGoal() ? "Safety cap reached." : "");
+        if (completed >= options.cap()) return finishBattles(options.hasStorageGoal() ? "Safety cap reached." : "");
         if (options.hasStorageGoal()) {
             StorageMeter.Levels storage = board.storage();
             if (storage == null) {
@@ -152,14 +228,121 @@ final class BuilderRun {
             storageDeadline = 0;
             if (options.verify) return done(storage.summary(options.storageGoal.percent) + " No game input sent.");
             if (options.storageGoal.reached(storage)) {
-                return finishBattles("Goal reached: " + storage.summary(options.storageGoal.percent));
+                return finishBattles("Goal reached: " + storage.summary(options.storageGoal.percent), true);
             }
         }
+        startPlan();
         board.tap(base.point);
         phase = Phase.MENU;
         deadline = now + MENU_WAIT;
         cooldownLimit = now + MAX_ATTACK_COOLDOWN;
         return running("Opening Battle menu");
+    }
+
+    private void startPlan() throws IOException {
+        plan = options.strategy == Strategy.COMPARE ? BattleScore.nextPlan(journal.comparisonCount(options.profile()))
+                : new Plan(options.strategy, options.overcharge);
+        healthTriggered = heroPowers = splitFallbacks = 0;
+        partial = false;
+    }
+
+    private Status recheckScreen(Board board, long now) throws IOException {
+        // The game clock kept running, and the user could have changed the card selection.
+        // Never confirm or send a map tap using a selection from before the interruption.
+        selected = attempted = null;
+        if (phase == Phase.DEPLOY || phase == Phase.WATCH) {
+            partial = true;
+            if (board.find(Mark.RETURN) != null) return waitForResult(now);
+            if (board.find(Mark.BASE) != null) {
+                phase = Phase.READY;
+                useRequestedSettings();
+                return running("Back at Builder Base; no result was visible");
+            }
+            Mark live = liveBanner(board);
+            if (live == null) throw new ScreenUnavailable("Return to the active Builder Battle or its result.");
+            boolean nextStage = live == Mark.STARTS && sawEnds && stage != 2;
+            // Either banner may belong to stage two if we missed the transition.
+            int number = nextStage || stage == 2 ? 2 : 0;
+            var tapped = new HashSet<>(charged);
+            boolean spent = heroPowerSpent;
+            boolean spedUp = speedTapped;
+            var confirmed = new HashMap<Point, Long>();
+            if (!nextStage && number == 2) confirmed.putAll(deployed);
+            else if (!nextStage && options.secondStage && plan.overcharge() == Overcharge.HALF_HP) {
+                // An unknown stage may have a new troop bar. Keep only positively re-read units.
+                for (Point card : deployed.keySet()) {
+                    if (board.pekkaHealth(card) != PekkaHealth.UNKNOWN) confirmed.put(card, now);
+                }
+            }
+            enterStage(number, live, now);
+            if (!nextStage) {
+                charged.addAll(tapped);
+                heroPowerSpent = spent;
+                speedTapped = spedUp;
+            }
+            deployed.putAll(confirmed);
+            return running("Resuming " + stageLabel());
+        }
+        if (phase == Phase.READY) {
+            storageDeadline = 0;
+            return begin(board, now);
+        }
+        if (phase == Phase.SEARCH || phase == Phase.MENU) {
+            if (board.find(Mark.BASE) != null) {
+                phase = Phase.READY;
+                useRequestedSettings();
+                return running("Back at Builder Base");
+            }
+            Mark live = liveBanner(board);
+            if (live != null) {
+                partial = true;
+                battleStarted = now;
+                enterStage(0, live, now);
+                return running("Taking over the current Builder Battle");
+            }
+            if (phase == Phase.SEARCH && board.find(Mark.RETURN) != null) {
+                partial = true;
+                stage = 0;
+                battleStarted = now;
+                return waitForResult(now);
+            }
+            if (board.find(Mark.FIND) != null || board.find(Mark.ATTACK_COOLDOWN) != null) {
+                phase = Phase.MENU;
+                deadline = now + MENU_WAIT;
+                cooldownLimit = now + MAX_ATTACK_COOLDOWN;
+                return running("Builder Battle menu recognized");
+            }
+            throw new ScreenUnavailable("Return to Builder Base, the battle menu, or the active battle.");
+        }
+        if (phase == Phase.RESULT_PENDING) {
+            if (board.find(Mark.RETURN) != null) return null;
+            if (board.find(Mark.BASE) != null) {
+                phase = Phase.READY;
+                useRequestedSettings();
+                return running("Back at Builder Base; no result was saved");
+            }
+            throw new ScreenUnavailable("Return to the battle result or Builder Base.");
+        }
+        if (phase == Phase.RESULT || phase == Phase.RETURNING) {
+            if (board.find(Mark.BASE) != null) return returnToBase(board, now);
+            if (phase == Phase.RESULT && board.find(Mark.RETURN) != null) return null;
+            throw new ScreenUnavailable("Return to Builder Base or finish leaving the result screen.");
+        }
+        if (board.find(Mark.CART_TITLE) != null) {
+            if (phase == Phase.CART_RETURN) throw new ScreenUnavailable("Close the Elixir Cart to continue.");
+            if (phase == Phase.CART_FIND || phase == Phase.CART_OPEN || phase == Phase.CART_CLOSE) {
+                deadline = now + 4_000;
+            }
+            return null;
+        }
+        if (board.find(Mark.BASE) != null) {
+            if (phase == Phase.CART_VERIFY || phase == Phase.CART_CLOSE || phase == Phase.CART_RETURN) {
+                return options.mode == Mode.CART ? done("Collect tapped. Back at Builder Base.") : cartFinished();
+            }
+            phase = Phase.CART_FIND;
+            return running("Back at Builder Base; looking for the cart");
+        }
+        throw new ScreenUnavailable("Return to Builder Base or its Elixir Cart.");
     }
 
     private boolean cartDue() {
@@ -172,7 +355,9 @@ final class BuilderRun {
             deadline = now + 2_500;
             return openCart(board, now);
         }
-        need(board.find(Mark.BASE), "Open Builder Base and dismiss any dialogs.");
+        if (board.find(Mark.BASE) == null) {
+            throw new ScreenUnavailable("Open Builder Base or its Elixir Cart.");
+        }
         Match cart = board.find(Mark.CART_WORLD);
         if (options.verify) return done(cart != null
                 ? "Shoreline cart recognized. No game input sent."
@@ -268,6 +453,7 @@ final class BuilderRun {
     private Status search(Board board, long now) throws IOException {
         Mark banner = banner(board);
         if (banner != null) {
+            battleStarted = now;
             enterStage(1, banner, now);
             return running("Reading stage 1");
         }
@@ -276,29 +462,34 @@ final class BuilderRun {
     }
 
     private Status battle(Board board, long now) throws IOException {
-        Match home = board.find(Mark.RETURN);
-        if (home != null) {
-            if (options.strategy == Strategy.COMPARE) pendingScore = board.result();
-            board.tap(home.point);
-            phase = Phase.RETURNING;
-            deadline = now + 18_000;
-            return running("Returning to Builder Base");
-        }
-        Mark banner = banner(board);
-        if (banner == Mark.STARTS && sawEnds && stage == 1) {
+        if (board.find(Mark.RETURN) != null) return waitForResult(now);
+        Mark banner = partial ? liveBanner(board) : banner(board);
+        if (banner == Mark.STARTS && sawEnds && stage != 2) {
             enterStage(2, banner, now);
             return running(options.secondStage ? "Reading stage 2" : "Watching stage 2");
         }
         if (banner == Mark.ENDS) sawEnds = true;
-        if (banner != Mark.ENDS || selected != null) nearbyLastFrame.clear();
         before(now, "No Builder Battle result appeared. Take over in the game.");
-        Point hero = options.hero ? board.heroSlot() : null;
+        boolean deployAllowed = stage == 1 || options.secondStage;
+        Point hero = options.hero && deployAllowed ? board.heroSlot() : null;
+        if (partial && banner != null && hero != null && !hero.equals(attempted)
+                && board.heroCard() == HeroCard.DEPLOYED) deployed.putIfAbsent(hero, now);
         if (phase == Phase.WATCH) {
-            Status ability = banner == Mark.ENDS ? combatAbility(board, hero, now) : null;
+            Status ability = deployAllowed && banner == Mark.ENDS ? combatAbility(board, hero, now) : null;
             if (ability != null) return ability;
-            if (banner != Mark.ENDS || hero == null || deployed.containsKey(hero) || lateHero
-                    || heroMisses == HERO_DROPS || (stage == 2 && !options.secondStage)
-                    || board.heroCard() != HeroCard.READY) return running("Watching stage " + stage);
+            boolean recoverHero = banner == Mark.ENDS && hero != null && !deployed.containsKey(hero)
+                    && !lateHero && heroMisses < HERO_DROPS && board.heroCard() == HeroCard.READY;
+            if (!recoverHero) {
+                if (banner == Mark.ENDS && !speedTapped) {
+                    Match speed = board.find(Mark.SPEED_1X);
+                    if (speed != null) {
+                        board.tap(speed.point);
+                        speedTapped = true;
+                        return running("Battle speed: tapped 1× for 4×");
+                    }
+                }
+                return running("Watching " + stageLabel());
+            }
             // If selection or deployment hid the hero's card earlier, give only that card a recovery window.
             lateHero = true;
             readyUntil = now + 12_000;
@@ -326,6 +517,7 @@ final class BuilderRun {
                     if (lane == 0) return stopDeploying("No legal troop drop found. Take over in the game.");
                     // Keep deploying with the confirmed primary lane if this layout blocks the split.
                     primaryOnly = true;
+                    splitFallbacks++;
                     misses = 0;
                 }
             }
@@ -357,7 +549,7 @@ final class BuilderRun {
             heroAction = selected.equals(hero);
             // Keep the hero behind the opening troop, without advancing the Split rotation.
             int deployedTroops = deployed.size() - (hero != null && deployed.containsKey(hero) ? 1 : 0);
-            lane = strategy() == Strategy.SPLIT && !primaryOnly && !heroAction ? deployedTroops % 2 : 0;
+            lane = plan.deployment() == Strategy.SPLIT && !primaryOnly && !heroAction ? deployedTroops % 2 : 0;
             Point workingPlace = workingPlaces[lane];
             int candidate = heroAction ? heroMisses : misses;
             Point target = workingPlace != null && (!heroAction || candidate == 0)
@@ -368,7 +560,7 @@ final class BuilderRun {
             attempted = selected;
             selected = null;
         }
-        return deploying(heroAction ? "Deploying hero in stage " + stage : "Deploying stage " + stage);
+        return deploying(heroAction ? "Deploying hero in " + stageLabel() : "Deploying " + stageLabel());
     }
 
     private Point nextCard(List<Point> ready, Point hero) {
@@ -390,74 +582,97 @@ final class BuilderRun {
             if (power == HeroPower.READY && !heroPowerSpent) {
                 board.tap(hero);
                 heroPowerSpent = true;
-                nearbyLastFrame.clear();
+                heroPowers++;
                 return deploying("Hero ability: fully charged");
             }
         }
-        ChargeCue cue = activateOvercharge(board, now);
-        return cue == ChargeCue.WAIT ? null : overchargeStatus(cue);
-    }
-
-    private ChargeCue activateOvercharge(Board board, long now) throws IOException {
-        if (options.overcharge == Overcharge.GAME) return ChargeCue.WAIT;
-        // Only inspect confirmed, already-deployed slots; never guess from elapsed battle time alone.
+        if (plan.overcharge() != Overcharge.HALF_HP) return null;
+        // Wait for a fresh combat frame after confirming deployment, not a timer.
         for (var deployment : deployed.entrySet()) {
             Point card = deployment.getKey();
-            if (now - deployment.getValue() < 4_000 || charged.contains(card)) continue;
-            ChargeCue cue = board.overchargeCue(card);
-            if (cue == ChargeCue.WAIT) nearbyLastFrame.remove(card);
-            // Require two consecutive reads of a cluster before spending the one-shot ability.
-            if (cue == ChargeCue.WAIT || (cue == ChargeCue.NEAR_TARGETS && nearbyLastFrame.add(card))) continue;
+            if (now <= deployment.getValue() || charged.contains(card)
+                    || board.pekkaHealth(card) != PekkaHealth.AT_OR_BELOW_HALF) continue;
             board.tap(card);
+            healthTriggered++;
             charged.add(card);
-            nearbyLastFrame.clear();
-            return cue;
+            return deploying("Overcharge: 50% HP");
         }
-        return ChargeCue.WAIT;
-    }
-
-    private Status overchargeStatus(ChargeCue cue) {
-        return deploying(cue == ChargeCue.NEAR_TARGETS ? "Overcharge: near targets" : "Overcharge: low HP");
+        return null;
     }
     private Status stopDeploying(String failure) throws IOException {
-        if (deployed.isEmpty()) throw new IOException(failure);
+        if (deployed.isEmpty() && !partial) throw new IOException(failure);
         phase = Phase.WATCH;
-        return running("Watching stage " + stage);
+        return running("Watching " + stageLabel());
+    }
+
+    private Status waitForResult(long now) {
+        // Return Home is visible before the damage percentage finishes counting up.
+        resultSeen = now;
+        phase = Phase.RESULT_PENDING;
+        deadline = now + 18_000;
+        return progress("Waiting for the score to settle", RESULT_SETTLE);
+    }
+
+    private Status readResult(Board board, long now) throws IOException {
+        long remaining = resultSeen + RESULT_SETTLE - now;
+        if (remaining > 0) return progress("Waiting for the score to settle", remaining);
+        if (board.find(Mark.RETURN) == null) {
+            before(now, "Builder Battle result disappeared before it could be saved.");
+            return running("Looking for the battle result");
+        }
+        journal.record(new Entry(plan, options.strategy == Strategy.COMPARE && !partial,
+                options.profile(), stage, resultSeen - battleStarted, healthTriggered, 0, heroPowers, splitFallbacks,
+                board.result(), partial));
+        phase = Phase.RESULT;
+        deadline = now + 18_000;
+        return running("Battle result saved");
+    }
+
+    private Status leaveResult(Board board, long now) throws IOException {
+        Match home = board.find(Mark.RETURN);
+        if (home != null) {
+            board.tap(home.point);
+            phase = Phase.RETURNING;
+            deadline = now + 18_000;
+            return running("Returning to Builder Base");
+        }
+        return returnToBase(board, now);
     }
 
     private Status returnToBase(Board board, long now) throws IOException {
         if (board.find(Mark.BASE) != null) {
-            if (options.strategy == Strategy.COMPARE) {
-                scores.add(strategy(), pendingScore);
-                pendingScore = null;
-            }
             completed++;
-            if (completed == options.cap() && !cartDue()) {
+            useRequestedSettings();
+            if (completed >= options.cap() && !cartDue()) {
                 return finishBattles(options.hasStorageGoal() ? "Safety cap reached." : "");
             }
             phase = Phase.READY; // Verify the village again before another tap.
             if (options.hasStorageGoal() || cartDue()) {
                 return new Status("Battle " + completed + " complete", false, 900);
             }
-            if (options.strategy == Strategy.COMPARE) return new Status(scores.summary(), false, 340);
             return running("Battle " + completed + " complete");
         }
-        before(now, "Builder Base didn't reappear. Check for an in-game dialog.");
+        if (now >= deadline) {
+            throw new ScreenUnavailable("Builder Base didn't reappear. Check for an in-game dialog.");
+        }
         return running("Returning to Builder Base");
     }
 
     private Status finishBattles(String reason) {
-        String summary = options.strategy == Strategy.COMPARE && completed > 0 ? scores.summary()
-                : "Finished " + completed + (completed == 1 ? " battle." : " battles.");
-        return done(reason.isEmpty() ? summary : summary + "\n" + reason);
+        return finishBattles(reason, false);
+    }
+
+    private Status finishBattles(String reason, boolean goalReached) {
+        String summary = "Finished " + completed + (completed == 1 ? " battle." : " battles.");
+        return new Status(reason.isEmpty() ? summary : summary + "\n" + reason, true, 0, goalReached);
     }
 
     private void enterStage(int number, Mark banner, long now) {
         stage = number;
         sawEnds = banner == Mark.ENDS;
+        speedTapped = false;
         deployed.clear();
         charged.clear();
-        nearbyLastFrame.clear();
         heroMisses = 0;
         lateHero = false;
         heroPowerSpent = false;
@@ -479,9 +694,14 @@ final class BuilderRun {
         return Mark.ENDS;
     }
 
-    private static Match need(Match match, String message) throws IOException {
-        if (match == null) throw new IOException(message);
-        return match;
+    static Mark liveBanner(Board board) {
+        Mark banner = banner(board);
+        return banner != null && (board.find(Mark.ATTACKER) != null || board.find(Mark.DEFENDER) != null)
+                ? banner : null;
+    }
+
+    private String stageLabel() {
+        return stage == 0 ? "current stage" : "stage " + stage;
     }
 
     private void before(long time, String message) throws IOException {
@@ -495,14 +715,8 @@ final class BuilderRun {
     private Status deploying(String detail) { return progress(detail, 70); }
 
     private Status progress(String detail, long delayMs) {
-        String tag = options.strategy == Strategy.COMPARE ? "  " + strategy().label : "";
-        return new Status((completed + 1) + "/" + options.cap() + tag + "  ·  " + detail, false, delayMs);
-    }
-
-    private Strategy strategy() {
-        if (options.strategy != Strategy.COMPARE) return options.strategy;
-        // Reverse the order every other pair to balance gradual changes in matchmaking.
-        return completed % 4 == 0 || completed % 4 == 3 ? Strategy.FOCUS : Strategy.SPLIT;
+        String treatment = options.strategy == Strategy.COMPARE && plan != null ? " · " + plan.label() : "";
+        return new Status((completed + 1) + "/" + options.cap() + " · " + detail + treatment, false, delayMs);
     }
 
     private static Status done(String detail) { return new Status(detail, true, 0); }

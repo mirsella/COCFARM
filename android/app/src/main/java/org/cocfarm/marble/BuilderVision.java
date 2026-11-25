@@ -1,26 +1,10 @@
 package org.cocfarm.marble;
 
-import android.content.res.AssetManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-
-import com.google.android.gms.tasks.Tasks;
-import com.google.mlkit.vision.common.InputImage;
-import com.google.mlkit.vision.text.TextRecognition;
-import com.google.mlkit.vision.text.TextRecognizer;
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
-
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
-import org.opencv.android.OpenCVLoader;
-import org.opencv.android.Utils;
 import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
@@ -30,28 +14,27 @@ import org.opencv.core.Scalar;
 import org.opencv.core.Size;
 import org.opencv.imgproc.Imgproc;
 
-import org.cocfarm.marble.BuilderRun.ChargeCue;
 import org.cocfarm.marble.BuilderRun.HeroCard;
 import org.cocfarm.marble.BuilderRun.HeroPower;
 import org.cocfarm.marble.BuilderRun.Mark;
 import org.cocfarm.marble.BuilderRun.Match;
 import org.cocfarm.marble.BuilderRun.Mode;
 import org.cocfarm.marble.BuilderRun.Options;
-import org.cocfarm.marble.BuilderRun.Overcharge;
+import org.cocfarm.marble.BuilderRun.PekkaHealth;
 import org.cocfarm.marble.BuilderRun.Point;
 
 final class BuilderVision implements AutoCloseable {
     private static final int HEIGHT = 920;
     private static final int WIDTH = 1177;
+    private static final int HEALTH_BAR_WIDTH = 84;
+    private static final int HEALTH_BAR_HEIGHT = 8;
     private final EnumMap<Mark, Mat> templates = new EnumMap<>(Mark.class);
     private final List<Mat> cartBodies = new ArrayList<>();
-    private final AssetManager assets;
+    private final NumberReader numbers;
     private Mat storageHud;
     private Mat machine;
     private Mat copter;
     private Mat pekka;
-    private OverchargeVision overcharge;
-    private TextRecognizer recognizer;
     private int rawWidth;
     private int rawHeight;
     private double scale;
@@ -61,44 +44,51 @@ final class BuilderVision implements AutoCloseable {
         void swipe(Point start, Point end) throws IOException;
         boolean clear(Point start, Point end);
     }
+
+    interface Asset {
+        Mat load(String name) throws IOException;
+    }
+
+    interface NumberReader {
+        String read(Mat image) throws IOException;
+    }
+
+    record HeroReading(HeroCard state, double machineScore, double copterScore, Point nominalSlot,
+                       Point portraitCenter, Integer portraitTop, Integer saturation, boolean healthBar) {}
+
     private record Hit(Rect bounds, double score) {
         Match match() {
             return new Match(new Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2), score);
         }
     }
 
-    BuilderVision(AssetManager assets) throws IOException {
-        this.assets = assets;
-        if (!OpenCVLoader.initLocal()) throw new IOException("Couldn't load the bundled vision library.");
+    BuilderVision(Asset assets, NumberReader numbers) throws IOException {
+        this.numbers = numbers;
         Core.setNumThreads(2);
         try {
-            templates.put(Mark.BASE, load(assets, "battle"));
-            templates.put(Mark.FIND, load(assets, "find_now"));
-        templates.put(Mark.ATTACK_COOLDOWN, load(assets, "marble_attack_cooldown"));
-            templates.put(Mark.STARTS, load(assets, "battle_starts"));
-            templates.put(Mark.ENDS, load(assets, "battle_ends"));
-            templates.put(Mark.RETURN, load(assets, "return_home"));
-            for (String name : List.of("cart_world", "cart_world/empty", "cart_world/ready")) {
-                cartBodies.add(load(assets, name));
+            templates.put(Mark.BASE, assets.load("battle"));
+            templates.put(Mark.FIND, assets.load("find_now"));
+            templates.put(Mark.ATTACK_COOLDOWN, assets.load("marble_attack_cooldown"));
+            templates.put(Mark.STARTS, assets.load("battle_starts"));
+            templates.put(Mark.ENDS, assets.load("battle_ends"));
+            templates.put(Mark.ATTACKER, assets.load("marble_attacker"));
+            templates.put(Mark.DEFENDER, assets.load("marble_defender"));
+            templates.put(Mark.SPEED_1X, assets.load("speed_1x"));
+            templates.put(Mark.RETURN, assets.load("return_home"));
+            for (String name : List.of("cart_world", "cart_world/empty", "cart_world/ready",
+                    "cart_world/marked", "cart_world/filled_alternate")) {
+                cartBodies.add(assets.load(name));
             }
-            templates.put(Mark.CART_TITLE, load(assets, "cart_title"));
-            templates.put(Mark.COLLECT, load(assets, "cart_collect"));
-            templates.put(Mark.CART_CLOSE, load(assets, "cart_close"));
-            storageHud = load(assets, "storage_hud");
-            machine = load(assets, "hero_machine");
-            copter = load(assets, "hero_copter");
-            pekka = load(assets, "power_pekka");
+            templates.put(Mark.CART_TITLE, assets.load("cart_title"));
+            templates.put(Mark.COLLECT, assets.load("cart_collect"));
+            templates.put(Mark.CART_CLOSE, assets.load("cart_close"));
+            storageHud = assets.load("storage_hud");
+            machine = assets.load("hero_machine");
+            copter = assets.load("hero_copter");
+            pekka = assets.load("power_pekka");
         } catch (IOException | RuntimeException e) {
             close();
             throw e;
-        }
-    }
-
-    private static Mat load(AssetManager assets, String name) throws IOException {
-        try (InputStream stream = assets.open("builder/" + name + ".png")) {
-            Bitmap image = BitmapFactory.decodeStream(stream);
-            if (image == null) throw new IOException("Couldn't read Builder template " + name);
-            return rgb(image);
         }
     }
 
@@ -107,7 +97,7 @@ final class BuilderVision implements AutoCloseable {
         int w = header.width();
         int h = header.height();
         if (w <= h || (rawWidth != 0 && (w != rawWidth || h != rawHeight))) {
-            throw new IOException("Use full-screen landscape and keep the display size unchanged.");
+            throw new BuilderRun.ScreenUnavailable("Return to full-screen landscape at the original display size.");
         }
         rawWidth = w;
         rawHeight = h;
@@ -126,10 +116,33 @@ final class BuilderVision implements AutoCloseable {
                     Imgproc.cvtColor(normalized, normalized, Imgproc.COLOR_RGBA2RGB);
                     double anchor = options.mode() == Mode.CART ? calibrate(normalized, Mark.CART_TITLE) : 0;
                     if (anchor == 0) anchor = calibrate(normalized, Mark.BASE);
-                    if (anchor == 0) {
-                        throw new IOException("Couldn't recognize Builder Base. Open the second village in English.");
+                    if (anchor == 0 && options.mode() == Mode.BATTLES) {
+                        anchor = calibrate(normalized, Mark.ATTACKER);
+                        if (anchor == 0) anchor = calibrate(normalized, Mark.DEFENDER);
                     }
-                    scale = toReference / anchor;
+                    if (anchor == 0) {
+                        throw new BuilderRun.ScreenUnavailable(options.mode() == Mode.CART
+                                ? "Open Builder Base or its Elixir Cart in English."
+                                : "Open Builder Base or an active Builder Battle in English.");
+                    }
+                    double candidate = toReference / anchor;
+                    Mat check = new Mat();
+                    try {
+                        resize(pixels, check, candidate);
+                        Imgproc.cvtColor(check, check, Imgproc.COLOR_RGBA2RGB);
+                        // Verify the anchor before retaining this scale for future frames.
+                        Frame board = new Frame(check, options, input);
+                        if (board.find(Mark.BASE) == null && (options.mode() == Mode.CART
+                                ? board.find(Mark.CART_TITLE) == null
+                                : BuilderRun.liveBanner(board) == null)) {
+                            throw new BuilderRun.ScreenUnavailable(options.mode() == Mode.CART
+                                    ? "Open Builder Base or its Elixir Cart in English."
+                                    : "Open Builder Base or an active Builder Battle in English.");
+                        }
+                        scale = candidate;
+                    } finally {
+                        check.release();
+                    }
                 } finally {
                     normalized.release();
                 }
@@ -181,22 +194,6 @@ final class BuilderVision implements AutoCloseable {
             return hit == null ? 0 : hit.score;
         } finally {
             scaled.release();
-        }
-    }
-
-    private static Mat rgb(Bitmap image) {
-        Mat rgba = new Mat();
-        Mat rgb = new Mat();
-        try {
-            Utils.bitmapToMat(image, rgba);
-            Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB);
-            return rgb;
-        } catch (RuntimeException e) {
-            rgb.release();
-            throw e;
-        } finally {
-            rgba.release();
-            image.recycle();
         }
     }
 
@@ -254,6 +251,9 @@ final class BuilderVision implements AutoCloseable {
         return switch (mark) {
             case BASE -> new Rect(0, h * 72 / 100, Math.min(310, w / 3), h - h * 72 / 100);
             case STARTS, ENDS -> new Rect(w / 3, 0, w - 2 * (w / 3), h / 10);
+            case ATTACKER -> new Rect(w * 4 / 5, 0, w - w * 4 / 5, h / 12);
+            case DEFENDER -> new Rect(0, 0, w / 5, h / 12);
+            case SPEED_1X -> new Rect(w * 87 / 100, h * 43 / 100, w - w * 87 / 100, h * 24 / 100);
             case CART_WORLD -> new Rect(w / 6, 0, w - 2 * (w / 6), h * 2 / 3);
             case CART_TITLE -> new Rect(w / 4, h / 20, w / 2, h * 3 / 20);
             case RETURN -> new Rect(w / 3, h * 2 / 3, w - 2 * (w / 3), h - h * 2 / 3);
@@ -269,12 +269,9 @@ final class BuilderVision implements AutoCloseable {
         private final Options options;
         private final Input input;
         private final int cardY;
-        private HeroCard heroCard;
+        private final EnumMap<Mark, Match> marks = new EnumMap<>(Mark.class);
+        private HeroReading heroReading;
         private Hit heroPortrait;
-        private boolean bannersRead;
-        private Match starts;
-        private Match ends;
-        private OverchargeVision.Scene combat;
 
         Frame(Mat screen, Options options, Input input) {
             this.screen = screen;
@@ -284,14 +281,13 @@ final class BuilderVision implements AutoCloseable {
         }
 
         @Override public Match find(Mark mark) {
-            if (mark == Mark.STARTS || mark == Mark.ENDS) {
-                if (!bannersRead) {
-                    starts = findBanner(Mark.STARTS);
-                    ends = findBanner(Mark.ENDS);
-                    bannersRead = true;
-                }
-                return mark == Mark.STARTS ? starts : ends;
-            }
+            // Cache misses too; a frame never changes between recognition and input.
+            if (!marks.containsKey(mark)) marks.put(mark, detect(mark));
+            return marks.get(mark);
+        }
+
+        private Match detect(Mark mark) {
+            if (mark == Mark.STARTS || mark == Mark.ENDS) return findBanner(mark);
             Rect area = area(screen, mark);
             if ((mark == Mark.COLLECT || mark == Mark.CART_CLOSE) && find(Mark.CART_TITLE) == null) return null;
             if (mark == Mark.CART_WORLD) {
@@ -307,7 +303,7 @@ final class BuilderVision implements AutoCloseable {
             }
             Mat template = templates.get(mark);
             double threshold = switch (mark) {
-                case BASE, CART_TITLE -> .85;
+                case BASE, CART_TITLE, ATTACKER, DEFENDER -> .85;
                 case CART_CLOSE, ATTACK_COOLDOWN -> .86;
                 default -> .80;
             };
@@ -317,8 +313,12 @@ final class BuilderVision implements AutoCloseable {
             if (hit == null) return null;
             if (mark == Mark.BASE
                     && !hasColor(hit.bounds, new Scalar(18, 125, 215), new Scalar(40, 255, 255), .18)) return null;
+            if ((mark == Mark.ATTACKER || mark == Mark.DEFENDER)
+                    && !hasColor(hit.bounds, new Scalar(22, 70, 205), new Scalar(40, 255, 255), .15)) return null;
             if (mark == Mark.FIND
                     && !hasColor(hit.bounds, new Scalar(30, 65, 100), new Scalar(70, 255, 255), .18)) return null;
+            if (mark == Mark.SPEED_1X
+                    && !hasColor(hit.bounds, new Scalar(30, 65, 125), new Scalar(75, 255, 255), .20)) return null;
             if (mark == Mark.COLLECT) {
                 int[] hsv = medianHsv(hit.bounds);
                 if (hsv[0] < 30 || hsv[0] > 70 || hsv[1] <= 60) return null;
@@ -439,29 +439,38 @@ final class BuilderVision implements AutoCloseable {
         }
 
         @Override public HeroCard heroCard() {
-            if (heroCard != null) return heroCard;
-            heroCard = HeroCard.UNKNOWN;
+            return heroReading().state();
+        }
+
+        HeroReading heroReading() {
+            if (heroReading != null) return heroReading;
             Point slot = heroSlot();
-            if (slot == null) return heroCard;
+            if (slot == null) return heroReading = new HeroReading(HeroCard.UNKNOWN, 0, 0, null, null, null, null, false);
             int left = Math.max(0, slot.x() - 60);
             int right = Math.min(screen.cols(), slot.x() + 60);
             Rect search = new Rect(left, cardY - 56, right - left, 102);
-            Hit machineHit = match(screen, machine, search, .68);
-            Hit copterHit = match(screen, copter, search, .68);
+            Hit machineHit = match(screen, machine, search, 0);
+            Hit copterHit = match(screen, copter, search, 0);
             Hit hero = machineHit == null || (copterHit != null && copterHit.score > machineHit.score)
                     ? copterHit : machineHit;
-            // Selection shifts the portrait slightly. Deployment raises it well above both ready positions.
-            if (hero == null || medianHsv(hero.bounds)[1] < 50) return heroCard;
-            int top = hero.bounds.y - cardY;
-            int x = hero.match().point().x();
-            if (top >= -34 && top <= -18 && hero.score >= .74) {
-                heroCard = HeroCard.READY;
-            } else if (top <= -38 && hero.bounds.y >= 25 && x >= 38 && x + 40 <= screen.cols()
-                    && (hero.score >= .74 || heroHasHealthBar(hero))) {
-                heroCard = HeroCard.DEPLOYED;
-                heroPortrait = hero;
+            HeroCard state = HeroCard.UNKNOWN;
+            boolean health = false;
+            Point center = hero == null ? null : hero.match().point();
+            Integer top = hero == null ? null : hero.bounds.y - cardY;
+            Integer saturation = hero == null || hero.score < .68 ? null : medianHsv(hero.bounds)[1];
+            if (saturation != null && saturation >= 50) {
+                if (top >= -34 && top <= -18 && hero.score >= .74) {
+                    state = HeroCard.READY;
+                } else if (top <= -38 && hero.bounds.y >= 25 && center.x() >= 38 && center.x() + 40 <= screen.cols()) {
+                    health = heroHasHealthBar(hero);
+                    if (hero.score >= .74 || health) {
+                        state = HeroCard.DEPLOYED;
+                        heroPortrait = hero;
+                    }
+                }
             }
-            return heroCard;
+            return heroReading = new HeroReading(state, machineHit == null ? 0 : machineHit.score,
+                    copterHit == null ? 0 : copterHit.score, slot, center, top, saturation, health);
         }
 
         private boolean heroHasHealthBar(Hit hero) {
@@ -515,47 +524,33 @@ final class BuilderVision implements AutoCloseable {
 
         private int troopX(int slot) { return (int) Math.round(185 + barLeft() + slot * 103.6); }
 
-        @Override public ChargeCue overchargeCue(Point card) throws IOException {
+        @Override public PekkaHealth pekkaHealth(Point card) {
             int x = card.x();
             int slot = (int) Math.round((x - troopX(0)) / 103.6);
             if (card.y() != cardY || x < 45 || x + 45 >= screen.cols()
-                    || slot < 0 || slot >= 10 || troopX(slot) != x) return ChargeCue.WAIT;
+                    || slot < 0 || slot >= 10 || troopX(slot) != x) return PekkaHealth.UNKNOWN;
             Rect art = new Rect(x - 41, cardY - 12, 82, 50);
             Hit portrait = match(screen, pekka, art, .86);
-            if (portrait == null || medianHsv(portrait.bounds)[1] < 90) return ChargeCue.WAIT;
-            int health = deployedHealthWidth(x);
-            if (health < 6) return ChargeCue.WAIT;
-            boolean nearby = options.overcharge() == Overcharge.NEAR_TARGETS;
-            if (!nearby) return OverchargePolicy.cue(health, false, false, false);
-            if (overcharge == null) overcharge = new OverchargeVision(name -> load(assets, name));
-            if (combat == null) combat = overcharge.scene(screen, this::visibleOnMap);
-            Point unit = combat.unit(slot + 1);
-            return OverchargePolicy.cue(health, true, unit != null, unit != null && combat.hasCluster(unit));
-        }
-
-        private boolean visibleOnMap(Rect rect) throws IOException {
-            double factor = screen.rows() / (double) OverchargeVision.REF_HEIGHT;
-            Point start = new Point((int) (rect.x * factor), (int) (rect.y * factor));
-            Point end = new Point(Math.min(screen.cols() - 1, (int) ((rect.x + rect.width) * factor)),
-                    Math.min(screen.rows() - 1, (int) ((rect.y + rect.height) * factor)));
-            return input.clear(physical(start), physical(end));
+            return portrait != null && medianHsv(portrait.bounds)[1] >= 90
+                    ? classifyPekkaHealth(deployedHealthWidth(x)) : PekkaHealth.UNKNOWN;
         }
 
         private int deployedHealthWidth(int x) {
             // The deployed card has a colored, left-aligned health strip.
-            Mat crop = screen.submat(new Rect(x - 42, cardY - 30, 84, 8));
+            Mat crop = screen.submat(new Rect(x - HEALTH_BAR_WIDTH / 2, cardY - 30,
+                    HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT));
             Mat hsv = new Mat();
             try {
                 Imgproc.cvtColor(crop, hsv, Imgproc.COLOR_RGB2HSV);
-                byte[] pixels = new byte[84 * 8 * 3];
+                byte[] pixels = new byte[HEALTH_BAR_WIDTH * HEALTH_BAR_HEIGHT * 3];
                 hsv.get(0, 0, pixels);
                 int start = -1;
                 int end = -1;
                 int filled = 0;
-                for (int col = 0; col < 84; col++) {
+                for (int col = 0; col < HEALTH_BAR_WIDTH; col++) {
                     int colored = 0;
-                    for (int row = 0; row < 8; row++) {
-                        int i = 3 * (84 * row + col);
+                    for (int row = 0; row < HEALTH_BAR_HEIGHT; row++) {
+                        int i = 3 * (HEALTH_BAR_WIDTH * row + col);
                         int hue = pixels[i] & 255;
                         if ((hue <= 85 || hue >= 170) && (pixels[i + 1] & 255) > 120
                                 && (pixels[i + 2] & 255) > 100) colored++;
@@ -573,36 +568,38 @@ final class BuilderVision implements AutoCloseable {
             }
         }
 
-        @Override public BattleScore.Result result() {
-            if (recognizer == null) recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
-            // The return button guards these crops. Keep the damage number and gold
-            // amount isolated from the surrounding labels, icons, and trophy count.
+        @Override public BattleScore.Result result() throws IOException {
+            // The return button guards these crops. Keep labels and icons outside each number.
             int w = screen.cols();
             int h = screen.rows();
             Integer damage = BattleScore.damage(readNumber(new Rect(w * 44 / 100, h * 40 / 100,
                     w * 12 / 100, h * 8 / 100)));
             Integer gold = BattleScore.gold(readNumber(new Rect(w * 56 / 100, h * 60 / 100,
                     w * 8 / 100, h * 45 / 1000)));
-            return new BattleScore.Result(gold, damage);
+            Integer trophies = BattleScore.trophies(readNumber(new Rect(w * 56 / 100, h * 664 / 1000,
+                    w * 8 / 100, h * 42 / 1000)));
+            return new BattleScore.Result(gold, damage, trophies);
         }
 
-        private String readNumber(Rect region) {
+        private String readNumber(Rect region) throws IOException {
+            Point topLeft = physical(new Point(region.x, region.y));
+            Point bottomRight = physical(new Point(region.x + region.width - 1, region.y + region.height - 1));
+            if (!input.clear(topLeft, bottomRight)) return "";
             Mat crop = screen.submat(region);
             Mat enlarged = new Mat();
+            Mat ink = new Mat();
+            Mat padded = new Mat();
             try {
                 resize(crop, enlarged, 2);
-                Bitmap image = Bitmap.createBitmap(enlarged.cols(), enlarged.rows(), Bitmap.Config.ARGB_8888);
-                Utils.matToBitmap(enlarged, image);
-                var text = recognizer.process(InputImage.fromBitmap(image, 0));
-                text.addOnCompleteListener(Runnable::run, done -> image.recycle());
-                return Tasks.await(text, 2, TimeUnit.SECONDS).getText();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return "";
-            } catch (ExecutionException | TimeoutException e) {
-                android.util.Log.w("MarbleRunner", "Couldn't read an A/B result field", e);
-                return "";
+                // The score uses white lettering on a blue, partly transparent panel.
+                // Isolate the lettering and add a quiet border for the recognizer.
+                Core.inRange(enlarged, new Scalar(220, 220, 220), new Scalar(255, 255, 255), ink);
+                Core.bitwise_not(ink, ink);
+                Core.copyMakeBorder(ink, padded, 16, 16, 16, 16, Core.BORDER_CONSTANT, new Scalar(255));
+                return numbers.read(padded);
             } finally {
+                padded.release();
+                ink.release();
                 enlarged.release();
                 crop.release();
             }
@@ -633,16 +630,17 @@ final class BuilderVision implements AutoCloseable {
             // Both lanes stay in the left deployment strip and clear of battle controls.
             Point percent = lane == 1 ? switch (miss) {
                 case 0 -> new Point(19, 63);
-                case 1 -> new Point(23, 62);
+                case 1 -> new Point(13, 60);
                 case 2 -> new Point(20, 58);
                 default -> throw new IOException("No more lower-lane drop candidates.");
             } : switch (miss) {
                 case 0 -> new Point(19, 49);
-                case 1 -> new Point(22, 47);
+                // Wider bases can put every interior retry inside the red deployment boundary.
+                case 1 -> new Point(13, 45);
                 case 2 -> new Point(17, 53);
-                case 3 -> new Point(24, 42);
-                case 4 -> new Point(20, 56);
-                case 5 -> new Point(26, 50);
+                case 3 -> new Point(11, 51);
+                case 4 -> new Point(22, 47);
+                case 5 -> new Point(24, 42);
                 default -> throw new IOException("No more troop drop candidates.");
             };
             int x = screen.cols() * percent.x() / 100;
@@ -684,9 +682,14 @@ final class BuilderVision implements AutoCloseable {
         }
 
         @Override public void close() {
-            if (combat != null) combat.close();
             screen.release();
         }
+    }
+
+    static PekkaHealth classifyPekkaHealth(int width) {
+        // A nearly empty strip is indistinguishable from a dead or unreadable card.
+        if (width < 6 || width > HEALTH_BAR_WIDTH) return PekkaHealth.UNKNOWN;
+        return width <= HEALTH_BAR_WIDTH / 2 ? PekkaHealth.AT_OR_BELOW_HALF : PekkaHealth.ABOVE_HALF;
     }
 
     @Override public void close() {
@@ -696,7 +699,5 @@ final class BuilderVision implements AutoCloseable {
         if (machine != null) machine.release();
         if (copter != null) copter.release();
         if (pekka != null) pekka.release();
-        if (overcharge != null) overcharge.close();
-        if (recognizer != null) recognizer.close();
     }
 }

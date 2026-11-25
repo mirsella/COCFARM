@@ -29,7 +29,7 @@ tasks.register('stageRunnerAssets', Sync) {
         include 'battle.png', 'find_now.png', 'marble_attack_cooldown.png', 'battle_starts.png', 'battle_ends.png',
                 'return_home.png', 'cart_world.png', 'cart_world/*.png', 'cart_title.png', 'cart_collect.png',
                 'cart_close.png', 'storage_hud.png', 'hero_machine.png', 'hero_copter.png', 'power_pekka.png',
-                'overcharge/*.png'
+                'marble_attacker.png', 'marble_defender.png', 'speed_1x.png'
         into 'builder'
     }
     from('../..') {

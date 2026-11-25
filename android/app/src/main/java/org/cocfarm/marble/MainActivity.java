@@ -38,11 +38,11 @@ public final class MainActivity extends Activity {
         page.addView(content);
         setContentView(page);
 
-        Ui.line(content, Ui.text(this, "COCFARM    /    DEVICE 01", 12, Ui.LIME, true), 8);
-        Ui.line(content, Ui.text(this, "Marble Runner", 46, Ui.TEXT, false), 4);
+        Ui.line(content, Ui.text(this, "MARBLE    /    DEVICE 01", 12, Ui.LIME, true), 8);
+        Ui.line(content, Ui.text(this, getString(R.string.app_name), 46, Ui.TEXT, false), 4);
         Ui.line(content, Ui.text(this, "Builder Base field controls", 20, Ui.MUTED, false), 1);
         Ui.line(content, Ui.text(this,
-                "Give Marble Runner root in KernelSU Manager. Nothing starts until you tap Start over the game.",
+                "Give COCFARM root in KernelSU Manager. Nothing starts until you tap Start over the game.",
                 16, Ui.TEXT, false), 20);
 
         LinearLayout setup = Ui.stack(this);
@@ -65,6 +65,8 @@ public final class MainActivity extends Activity {
             if (game == null) Toast.makeText(this, "Clash of Clans isn't installed.", Toast.LENGTH_LONG).show();
             else startActivity(game);
         }), 8);
+        row(content, Ui.button(this, "Manage run alerts", false, v -> startActivity(new Intent(
+                Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()))), 8);
         Ui.line(content, Ui.text(this, "Use English and full-screen landscape. Run Check from the overlay before your first battle.",
                 15, Ui.MUTED, false), 16);
         Ui.line(content, Ui.text(this, "Game automation can get your Supercell account banned.",
@@ -101,7 +103,7 @@ public final class MainActivity extends Activity {
             startForegroundService(new Intent(this, OverlayService.class).setAction(OverlayService.SHOW));
         } catch (RuntimeException e) {
             android.util.Log.e("MarbleRunner", "Couldn't start overlay", e);
-            Toast.makeText(this, "Couldn't start the overlay. Reopen Marble Runner and try again.",
+            Toast.makeText(this, "Couldn't start the overlay. Reopen COCFARM and try again.",
                     Toast.LENGTH_LONG).show();
         }
     }

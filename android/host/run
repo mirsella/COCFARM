@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Build only the platform-independent Android battle code and the desktop driver.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+src="$root/android/app/src/main/java/org/cocfarm/marble"
+host="$root/android/host"
+jar="${OPENCV_JAR:-/usr/share/java/opencv.jar}"
+lib="${OPENCV_LIB:-/usr/lib}"
+if [[ ! -f "$jar" ]]; then
+    printf 'Install desktop OpenCV Java bindings or set OPENCV_JAR and OPENCV_LIB.\n' >&2
+    exit 1
+fi
+mkdir -p "$root/.scratch/host-build"
+classes=$(mktemp -d "$root/.scratch/host-build/classes.XXXXXX")
+trap 'rm -r -- "$classes"' EXIT
+sources=("$src"/{BuilderRun,BuilderVision,BattleScore,ScreenPixels,StorageMeter}.java "$host"/*.java)
+"${JAVAC:-javac}" --release 17 -cp "$jar" -d "$classes" "${sources[@]}"
+fingerprint=$(
+    cd "$root"
+    { printf '%s\0' "${sources[@]#"$root/"}" android/host/run; find templates/builder -name '*.png' -print0; } |
+        sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+)
+"${JAVA:-java}" -Djava.library.path="$lib" -cp "$classes:$jar" org.cocfarm.marble.HostRun \
+    "$root/templates/builder" "$fingerprint" "$(git -C "$root" rev-parse --short HEAD)" "$@"

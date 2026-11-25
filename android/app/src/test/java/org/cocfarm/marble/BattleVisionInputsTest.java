@@ -1,5 +1,8 @@
 package org.cocfarm.marble;
 
+import static org.cocfarm.marble.BuilderRun.PekkaHealth.ABOVE_HALF;
+import static org.cocfarm.marble.BuilderRun.PekkaHealth.AT_OR_BELOW_HALF;
+import static org.cocfarm.marble.BuilderRun.PekkaHealth.UNKNOWN;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
@@ -11,6 +14,16 @@ import java.nio.ByteOrder;
 import org.junit.Test;
 
 public class BattleVisionInputsTest {
+    @Test public void halfHealthTriggersEarlierButRejectsDeadOrUnreadableStrips() {
+        assertEquals(UNKNOWN, BuilderVision.classifyPekkaHealth(0));
+        assertEquals(UNKNOWN, BuilderVision.classifyPekkaHealth(5));
+        assertEquals(AT_OR_BELOW_HALF, BuilderVision.classifyPekkaHealth(6));
+        assertEquals(AT_OR_BELOW_HALF, BuilderVision.classifyPekkaHealth(42));
+        assertEquals(ABOVE_HALF, BuilderVision.classifyPekkaHealth(43));
+        assertEquals(ABOVE_HALF, BuilderVision.classifyPekkaHealth(84));
+        assertEquals(UNKNOWN, BuilderVision.classifyPekkaHealth(85));
+    }
+
     @Test public void validatesRawScreenFormatAndExactLength() throws IOException {
         byte[] data = new byte[16 + 4 * 4 * 2];
         ByteBuffer header = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
@@ -32,5 +45,9 @@ public class BattleVisionInputsTest {
         assertEquals(Integer.valueOf(0), BattleScore.damage("0%"));
         assertNull(BattleScore.damage("201%"));
         assertNull(BattleScore.damage("18"));
+        assertEquals(Integer.valueOf(14), BattleScore.trophies("14\n"));
+        assertEquals(Integer.valueOf(-14), BattleScore.trophies("−14"));
+        assertEquals(Integer.valueOf(0), BattleScore.trophies("0"));
+        assertNull(BattleScore.trophies("14 76000"));
     }
 }

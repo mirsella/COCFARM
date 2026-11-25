@@ -1,5 +1,6 @@
 package org.cocfarm.marble;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -7,6 +8,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.content.res.Configuration;
 import android.graphics.PixelFormat;
@@ -46,9 +48,11 @@ public final class OverlayService extends Service {
     private static final String TOGGLE = "org.cocfarm.marble.TOGGLE";
     private static final String CLOSE = "org.cocfarm.marble.CLOSE";
     private static final String CHANNEL = "marble_panel";
+    private static final String ALERT_CHANNEL = "cocfarm_run_alerts";
     private static final int NOTIFICATION = 41;
-    private static final int COMPACT_WIDTH = 208;
-    private static final int EXPANDED_WIDTH = 276;
+    private static final int RUN_ALERT = 42;
+    private static final int COMPACT_WIDTH = 306;
+    private static final int EXPANDED_WIDTH = 342;
     private static final int WINDOW_FLAGS =
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
 
@@ -57,6 +61,7 @@ public final class OverlayService extends Service {
     private final RunControl control = new RunControl();
     private final Runnable tick = this::tick;
     private RootDevice device;
+    private BattleHistory journal;
     private WindowManager windows;
     private NotificationManager notifications;
     private SharedPreferences prefs;
@@ -69,12 +74,16 @@ public final class OverlayService extends Service {
     private TextView compactStatus;
     private Button quickAction;
     private ScrollView settings;
+    private LinearLayout settingsContent;
+    private HistoryView history;
     private LinearLayout battleSettings;
     private TextView phaseLabel;
     private TextView detailLabel;
     private Button action;
     private Button second;
-    private Button gear;
+    private Button pauseButton;
+    private Button historyButton;
+    private TextView settingsHint;
     private Button modeButton;
     private Button stageButton;
     private Button heroButton;
@@ -89,14 +98,13 @@ public final class OverlayService extends Service {
     private Session session;
     private boolean inFlight;
     private boolean paused;
-    private boolean resetSelection;
-    private long pauseStarted;
-    private long pauseTotal;
-    private boolean showSettings;
+    private boolean recheckScreen;
+    private boolean showHistory;
     private boolean expanded;
     private boolean expandAfterTick;
     private boolean panelLayoutPending;
     private boolean dockedLeft;
+    private boolean dockAfterEdit;
     private boolean warning;
     private String detail;
     private Mode mode;
@@ -111,9 +119,15 @@ public final class OverlayService extends Service {
 
     private static final class Session implements AutoCloseable {
         final BuilderRun run;
-        BuilderVision vision;
+        final Mode mode;
+        final boolean verify;
+        AndroidVision vision;
 
-        Session(Options options) { run = new BuilderRun(options); }
+        Session(Options options, BattleHistory journal) {
+            mode = options.mode();
+            verify = options.verify();
+            run = new BuilderRun(options, journal);
+        }
 
         @Override public void close() {
             if (vision != null) vision.close();
@@ -123,6 +137,7 @@ public final class OverlayService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         device = new RootDevice(this);
+        journal = new BattleHistory(this);
         windows = getSystemService(WindowManager.class);
         notifications = getSystemService(NotificationManager.class);
         prefs = getSharedPreferences("runner", MODE_PRIVATE);
@@ -135,13 +150,7 @@ public final class OverlayService extends Service {
             case "COMPARE" -> Strategy.COMPARE;
             default -> Strategy.FOCUS;
         };
-        if (strategy == Strategy.COMPARE && limit % 2 != 0) limit++;
-        overcharge = switch (prefs.getString("overchargeMode", "")) {
-            case "NEAR_TARGETS" -> Overcharge.NEAR_TARGETS;
-            case "LOW_HP" -> Overcharge.LOW_HP;
-            case "GAME" -> Overcharge.GAME;
-            default -> prefs.getBoolean("overcharge", false) ? Overcharge.LOW_HP : Overcharge.GAME;
-        };
+        overcharge = Overcharge.fromPreference(prefs.getString("overchargeMode", ""), prefs.getBoolean("overcharge", false));
         offset = Math.max(-80, Math.min(360, prefs.getInt("offset", 0)));
         cartEvery = switch (prefs.getInt("cartEvery", 0)) {
             case 1 -> 1;
@@ -164,6 +173,8 @@ public final class OverlayService extends Service {
         if (storageGoal != Goal.BATTLE_LIMIT && cartEvery == 0) cartEvery = 3;
         notifications.createNotificationChannel(new NotificationChannel(CHANNEL, "Field controls",
                 NotificationManager.IMPORTANCE_LOW));
+        notifications.createNotificationChannel(new NotificationChannel(ALERT_CHANNEL, "Run alerts",
+                NotificationManager.IMPORTANCE_DEFAULT));
     }
 
     @Override public int onStartCommand(Intent command, int flags, int startId) {
@@ -203,7 +214,7 @@ public final class OverlayService extends Service {
             @Override public boolean dispatchTouchEvent(MotionEvent event) {
                 if (event.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
                     collapse();
-                    // Android also delivers the same touch to the game. This is only a notification.
+                    // The game still receives the touch; hold releases after compact bounds are ready.
                     return true;
                 }
                 return super.dispatchTouchEvent(event);
@@ -224,11 +235,13 @@ public final class OverlayService extends Service {
         handle.setContentDescription("Collapse field controls. Drag to move.");
         dragHandle(handle, this::collapse);
         Ui.cell(top, handle, 0, 38, 0);
-        gear = Ui.button(this, "Setup", false, v -> {
-            showSettings = !showSettings;
+        historyButton = Ui.button(this, "History", false, v -> {
+            showHistory = !showHistory;
+            if (showHistory) history.refresh(settings(false).profile());
+            settings.scrollTo(0, 0);
             render();
         });
-        Ui.cell(top, gear, 64, 38, 4);
+        Ui.cell(top, historyButton, 68, 38, 4);
         Button close = Ui.button(this, "×", false, v -> closePanel());
         close.setContentDescription("Stop and close field controls");
         Ui.cell(top, close, 38, 38, 4);
@@ -237,21 +250,17 @@ public final class OverlayService extends Service {
         phaseLabel = Ui.text(this, "", 11, Ui.LIME, true);
         Ui.line(full, phaseLabel, 8);
         detailLabel = Ui.text(this, "", 15, Ui.TEXT, false);
-        detailLabel.setMaxLines(3);
+        detailLabel.setMaxLines(2);
         detailLabel.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         Ui.line(full, detailLabel, 2);
 
         LinearLayout controls = Ui.row(this);
-        action = Ui.button(this, "Start", true, v -> {
-            if (session == null) begin(false);
-            else togglePause();
-        });
-        second = Ui.button(this, "Check", false, v -> {
-            if (session == null) begin(true);
-            else endSession("Stopped. Take over in the game.", false);
-        });
+        action = Ui.button(this, "Start", true, v -> startStop());
+        second = Ui.button(this, "Check", false, v -> begin(true));
+        pauseButton = Ui.button(this, "Pause", false, v -> togglePause());
         Ui.cell(controls, action, 0, 44, 0);
         Ui.cell(controls, second, 76, 44, 6);
+        Ui.cell(controls, pauseButton, 106, 44, 6);
         Ui.line(full, controls, 8);
         addSettings();
 
@@ -272,9 +281,15 @@ public final class OverlayService extends Service {
 
     private void addCompact() {
         compact = Ui.row(this);
-        compact.setPadding(Ui.dp(this, 4), Ui.dp(this, 2), Ui.dp(this, 4), Ui.dp(this, 2));
+        compact.setPadding(Ui.dp(this, 3), Ui.dp(this, 2), Ui.dp(this, 4), Ui.dp(this, 2));
+        quickAction = Ui.button(this, "Start", true, v -> {
+            if (paused) togglePause();
+            else startStop();
+        });
+        quickAction.setSingleLine();
+        Ui.cell(compact, quickAction, 76, 44, 0);
         statusHandle = Ui.row(this);
-        statusHandle.setPadding(Ui.dp(this, 6), 0, Ui.dp(this, 4), 0);
+        statusHandle.setPadding(Ui.dp(this, 10), 0, Ui.dp(this, 4), 0);
         dragHandle(statusHandle, this::expand);
         signal = new View(this);
         Ui.cell(statusHandle, signal, 6, 6, 0);
@@ -289,9 +304,6 @@ public final class OverlayService extends Service {
         caret.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         Ui.cell(statusHandle, caret, 12, 44, 3);
         Ui.cell(compact, statusHandle, 0, 44, 0);
-        quickAction = Ui.button(this, "Pause", false, v -> togglePause());
-        quickAction.setSingleLine();
-        Ui.cell(compact, quickAction, 68, 44, 3);
         Ui.line(panel, compact, 0);
     }
 
@@ -342,23 +354,33 @@ public final class OverlayService extends Service {
             expandAfterTick = true;
             return;
         }
+        boolean wasHeld = held();
         expanded = true;
+        updateHold(wasHeld);
         render();
     }
 
     private void collapse() {
         expandAfterTick = false;
         if (!expanded) return;
-        expanded = showSettings = false;
+        boolean wasHeld = held();
+        expanded = showHistory = false;
         render();
+        if (dockAfterEdit) {
+            dockAfterEdit = false;
+            if ((session != null ? session.mode : mode) == Mode.BATTLES && cartEvery > 0 && !dockedLeft) {
+                dockUpperLeft();
+            }
+        }
+        updateHold(wasHeld);
     }
 
     private void addSettings() {
         settings = new ScrollView(this) {
             @Override protected void onMeasure(int widthSpec, int heightSpec) {
                 int available = windows.getCurrentWindowMetrics().getBounds().height()
-                        - layout.y - Ui.dp(OverlayService.this, 175);
-                int maxHeight = Math.max(Ui.dp(OverlayService.this, 96), available);
+                        - layout.y - Ui.dp(OverlayService.this, 180);
+                int maxHeight = Math.max(Ui.dp(OverlayService.this, 64), available);
                 if (MeasureSpec.getMode(heightSpec) != MeasureSpec.UNSPECIFIED) {
                     maxHeight = Math.min(maxHeight, MeasureSpec.getSize(heightSpec));
                 }
@@ -366,13 +388,21 @@ public final class OverlayService extends Service {
             }
         };
         settings.setVerticalScrollBarEnabled(true);
-        LinearLayout settingsContent = Ui.stack(this);
-        settings.addView(settingsContent);
+        LinearLayout scrollContent = Ui.stack(this);
+        settings.addView(scrollContent);
+        settingsContent = Ui.stack(this);
+        Ui.line(scrollContent, settingsContent, 0);
+        history = new HistoryView(this);
+        Ui.line(scrollContent, history, 0);
         Ui.line(full, settings, 4);
+        settingsHint = Ui.text(this, "", 12, Ui.MUTED, false);
+        Ui.line(settingsContent, settingsHint, 2);
         modeButton = Ui.button(this, "", false, v -> {
             mode = mode == Mode.BATTLES ? Mode.CART : Mode.BATTLES;
-            detail = null;
-            warning = false;
+            if (session == null) {
+                detail = null;
+                warning = false;
+            }
             saveSettings();
         });
         LinearLayout modeRow = Ui.row(this);
@@ -383,6 +413,7 @@ public final class OverlayService extends Service {
         Ui.line(settingsContent, battleSettings, 0);
         LinearLayout farm = Ui.row(this);
         cartEveryButton = Ui.button(this, "", false, v -> {
+            if (cartEvery == 0) dockAfterEdit = true;
             cartEvery = switch (cartEvery) {
                 case 3 -> 5;
                 case 5 -> 10;
@@ -394,7 +425,10 @@ public final class OverlayService extends Service {
         });
         storageGoalButton = Ui.button(this, "", false, v -> {
             storageGoal = storageGoal.next();
-            if (storageGoal != Goal.BATTLE_LIMIT && cartEvery == 0) cartEvery = 3;
+            if (storageGoal != Goal.BATTLE_LIMIT && cartEvery == 0) {
+                dockAfterEdit = true;
+                cartEvery = 3;
+            }
             saveSettings();
         });
         Ui.cell(farm, cartEveryButton, 0, 42, 0);
@@ -413,15 +447,10 @@ public final class OverlayService extends Service {
                 case SPLIT -> Strategy.COMPARE;
                 case COMPARE -> Strategy.FOCUS;
             };
-            if (strategy == Strategy.COMPARE && limit % 2 != 0) limit++;
             saveSettings();
         });
         overchargeButton = Ui.button(this, "", false, v -> {
-            overcharge = switch (overcharge) {
-                case GAME -> Overcharge.LOW_HP;
-                case LOW_HP -> Overcharge.NEAR_TARGETS;
-                case NEAR_TARGETS -> Overcharge.GAME;
-            };
+            overcharge = overcharge == Overcharge.GAME ? Overcharge.HALF_HP : Overcharge.GAME;
             saveSettings();
         });
         Ui.cell(tactics, strategyButton, 0, 40, 0);
@@ -433,8 +462,7 @@ public final class OverlayService extends Service {
     }
 
     private void adjustBattleLimit(int direction) {
-        int step = strategy == Strategy.COMPARE ? 2 : 1;
-        limit = Math.max(step, Math.min(20, limit + step * direction));
+        limit = Math.max(1, Math.min(20, limit + direction));
         saveSettings();
     }
 
@@ -464,30 +492,34 @@ public final class OverlayService extends Service {
     private void render() {
         if (panel == null) return;
         boolean active = session != null;
-        String phase = active ? (paused ? "PAUSED" : "RUNNING") : (warning ? "STOPPED" : "READY");
-        int tint = paused || warning ? Ui.WARN : Ui.LIME;
+        String phase = active ? (paused ? "PAUSED" : expanded ? "EDITING" : "RUNNING")
+                : (warning ? "STOPPED" : "READY");
+        int tint = held() || warning ? Ui.WARN : Ui.LIME;
         compact.setVisibility(expanded ? View.GONE : View.VISIBLE);
         full.setVisibility(expanded ? View.VISIBLE : View.GONE);
-        String summary = paused ? "Paused · " + detail
+        String summary = paused ? "Paused · " + statusDetail()
                 : warning ? "Stopped · " + detail
                 : detail != null ? detail.replace('\n', ' ')
                 : mode == Mode.CART ? "Ready · Elixir Cart" : "Ready · Builder Battles";
         compactStatus.setText(summary);
         statusHandle.setContentDescription(summary + ". Expand field controls. Drag to move.");
         signal.setBackground(Ui.surface(this, tint, 0, 3));
-        String pauseLabel = paused ? "Resume" : "Pause";
-        quickAction.setText(pauseLabel);
-        quickAction.setVisibility(active ? View.VISIBLE : View.GONE);
-        phaseLabel.setText((mode == Mode.CART ? "ELIXIR" : cartEvery > 0 ? "FARM" : "GOLD") + "   /   " + phase);
+        String startStopLabel = active ? "Stop" : "Start";
+        Mode runningMode = active ? session.mode : mode;
+        phaseLabel.setText((runningMode == Mode.CART ? "ELIXIR CART" : "BUILDER BATTLES") + "   /   " + phase);
         phaseLabel.setTextColor(tint);
         String message = statusDetail();
-        detailLabel.setMaxLines(message.startsWith("A/B averages") ? 6 : 3);
         detailLabel.setText(message);
-        action.setText(active ? pauseLabel : (mode == Mode.BATTLES ? "Start" : "Collect"));
-        second.setText(active ? "Stop" : "Check");
-        gear.setVisibility(active ? View.GONE : View.VISIBLE);
-        gear.setText(showSettings ? "Done" : "Setup");
-        settings.setVisibility(!active && showSettings ? View.VISIBLE : View.GONE);
+        renderPrimary(action, startStopLabel, active);
+        renderPrimary(quickAction, paused ? "Resume" : startStopLabel, active && !paused);
+        second.setVisibility(active ? View.GONE : View.VISIBLE);
+        pauseButton.setVisibility(active ? View.VISIBLE : View.GONE);
+        pauseButton.setText(paused ? "Resume & close" : "Keep paused");
+        historyButton.setText(showHistory ? "Controls" : "History");
+        history.setVisibility(showHistory ? View.VISIBLE : View.GONE);
+        settingsContent.setVisibility(showHistory ? View.GONE : View.VISIBLE);
+        settingsHint.setText(active ? "Automation paused here. Battle settings apply to the next battle; mode on the next Start."
+                : "Changes save automatically.");
         battleSettings.setVisibility(mode == Mode.BATTLES ? View.VISIBLE : View.GONE);
         modeButton.setText(mode == Mode.BATTLES ? "Mode: Builder Battles" : "Mode: Elixir Cart");
         cartEveryButton.setText(cartEvery == 0 ? "Auto cart: off" : "Cart: every " + cartEvery);
@@ -499,22 +531,17 @@ public final class OverlayService extends Service {
         stageButton.setText(stageTwo ? "Stage 2: on" : "Stage 2: off");
         heroButton.setText(hero ? "Hero: on" : "Hero: off");
         strategyButton.setText("Plan: " + strategy.label);
-        overchargeButton.setText(switch (overcharge) {
-            case GAME -> "P.E.K.K.A: game";
-            case LOW_HP -> "P.E.K.K.A: low HP";
-            case NEAR_TARGETS -> "P.E.K.K.A: nearby";
-        });
-        if (overcharge == Overcharge.NEAR_TARGETS) {
-            overchargeButton.setContentDescription("P.E.K.K.A.: nearby targets, experimental");
-        } else {
-            overchargeButton.setContentDescription(null);
-        }
+        boolean comparing = strategy == Strategy.COMPARE;
+        overchargeButton.setText(comparing ? "P.E.K.K.A.: both" : "P.E.K.K.A.: " + overcharge.label);
+        overchargeButton.setEnabled(!comparing);
+        overchargeButton.setContentDescription(comparing ? "Compare rotates Game and 50 percent HP Overcharge"
+                : overcharge == Overcharge.HALF_HP ? "P.E.K.K.A.: trigger Overcharge at about 50 percent health" : null);
         limitLabel.setText("Battle limit: " + limit);
         ((View) limitLabel.getParent()).setVisibility(storageGoal == Goal.BATTLE_LIMIT ? View.VISIBLE : View.GONE);
         offsetLabel.setText("Troop bar: " + offset);
         int flags = WINDOW_FLAGS
                 | (expanded ? WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH : 0)
-                | (active && !paused ? WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON : 0);
+                | (active && !held() ? WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON : 0);
         int width = Ui.dp(this, expanded ? EXPANDED_WIDTH : COMPACT_WIDTH);
         if (layout.flags != flags || layout.width != width) {
             int available = windows.getCurrentWindowMetrics().getBounds().width();
@@ -526,9 +553,16 @@ public final class OverlayService extends Service {
         notifications.notify(NOTIFICATION, notification());
     }
 
+    private void renderPrimary(Button button, String label, boolean stop) {
+        if (!label.contentEquals(button.getText())) {
+            button.setText(label);
+            Ui.primaryFill(button, stop ? Ui.WARN : Ui.LIME);
+        }
+    }
+
     private String statusDetail() {
         if (detail != null) return detail;
-        return mode == Mode.CART ? "Collect finds the shoreline cart." : "Open Builder Base in landscape.";
+        return mode == Mode.CART ? "Start finds the shoreline cart." : "Start from Builder Base or a live battle.";
     }
 
     private void dockUpperLeft() {
@@ -542,50 +576,72 @@ public final class OverlayService extends Service {
 
     private void begin(boolean verify) {
         if (session != null) return;
+        if (!verify) notifications.cancel(RUN_ALERT);
         control.invalidate();
-        session = new Session(new Options(mode, limit, stageTwo, hero, offset, verify, strategy, overcharge,
-                cartEvery, storageGoal));
-        inFlight = paused = resetSelection = warning = showSettings = false;
+        session = new Session(settings(verify), journal);
+        inFlight = paused = recheckScreen = warning = showHistory = dockAfterEdit = false;
         expanded = expandAfterTick = false;
-        pauseTotal = 0;
         detail = "Checking the game screen…";
         render();
         if (mode == Mode.BATTLES && cartEvery > 0) dockUpperLeft();
         schedule(250);
     }
 
+    private Options settings(boolean verify) {
+        return new Options(mode, limit, stageTwo, hero, offset, verify, strategy, overcharge,
+                cartEvery, storageGoal);
+    }
+
+    private void startStop() {
+        if (session == null) begin(false);
+        else endSession("Stopped. Take over in the game.", false);
+    }
+
+    private boolean held() {
+        return session != null && (paused || expanded);
+    }
+
     private void togglePause() {
         if (session == null) return;
-        control.invalidate();
+        boolean wasHeld = held();
         paused = !paused;
-        if (paused) {
-            pauseStarted = SystemClock.elapsedRealtime();
-            main.removeCallbacks(tick);
-        } else {
-            pauseTotal += SystemClock.elapsedRealtime() - pauseStarted;
-            resetSelection = true;
-            schedule(250);
+        if (!paused && expanded) collapse();
+        else updateHold(wasHeld);
+        if (!session.verify) {
+            if (paused) postRunAlert("Paused", "Use Resume over Clash to continue.");
+            else notifications.cancel(RUN_ALERT);
         }
         render();
     }
 
+    private void updateHold(boolean wasHeld) {
+        if (session == null || wasHeld == held()) return;
+        control.invalidate();
+        if (held()) main.removeCallbacks(tick);
+        else {
+            recheckScreen = true;
+            detail = "Checking the current game screen…";
+            schedule(250);
+        }
+    }
+
     private void schedule(long delay) {
-        if (session == null || paused || inFlight) return;
+        if (session == null || held() || inFlight) return;
         main.removeCallbacks(tick);
         main.postDelayed(tick, delay);
     }
 
     private void tick() {
-        if (session == null || paused || inFlight) return;
+        if (session == null || held() || inFlight) return;
         if (panelLayoutPending) {
             schedule(50);
             return;
         }
         Session current = session;
+        Options edited = settings(false);
         int epoch = control.epoch();
-        long pausedFor = pauseTotal;
-        boolean reset = resetSelection;
-        resetSelection = false;
+        boolean reset = recheckScreen;
+        recheckScreen = false;
         inFlight = true;
         worker.execute(() -> {
             Status status = null;
@@ -594,11 +650,12 @@ public final class OverlayService extends Service {
                 control.require(epoch);
                 if (current.vision == null) {
                     RootDevice.checkRoot();
-                    current.vision = new BuilderVision(getAssets());
+                    current.vision = new AndroidVision(getAssets());
                 }
                 if (reset) current.run.resume();
                 control.require(epoch);
-                try (BuilderVision.Frame board = current.vision.frame(device.capture(), current.run.options,
+                Options frameOptions = current.run.applySettings(edited);
+                try (BuilderVision.Frame board = current.vision.frame(device.capture(), frameOptions,
                         new BuilderVision.Input() {
                             @Override public void tap(Point point) throws IOException {
                                 requireClearPath(point, point);
@@ -615,7 +672,7 @@ public final class OverlayService extends Service {
                             }
                         })) {
                     control.require(epoch);
-                    status = current.run.step(board, SystemClock.elapsedRealtime() - pausedFor);
+                    status = current.run.step(board, SystemClock.elapsedRealtime());
                 }
             } catch (IOException | RuntimeException e) {
                 failure = e;
@@ -624,7 +681,7 @@ public final class OverlayService extends Service {
             }
             Status result = status;
             Exception error = failure;
-            main.post(() -> afterTick(current, result, error));
+            main.post(() -> afterTick(current, epoch, result, error));
         });
     }
 
@@ -632,7 +689,7 @@ public final class OverlayService extends Service {
         Rect overlay = panelBounds;
         if (overlay == null) throw new IOException("Couldn't locate the field controls. Show them and try again.");
         if (!overlayClear(overlay, start, end)) {
-            throw new IOException("Field controls cover a target. Move the panel and restart.");
+            throw new BuilderRun.ScreenUnavailable("Field controls cover a target. Move them, then Resume.");
         }
     }
 
@@ -645,16 +702,26 @@ public final class OverlayService extends Service {
         return !overlay.intersects(left, top, right, bottom);
     }
 
-    private void afterTick(Session current, Status result, Exception error) {
+    private void afterTick(Session current, int epoch, Status result, Exception error) {
         if (session != current) return;
         inFlight = false;
-        if (error != null && !(error instanceof RunControl.Changed)) {
+        boolean screenBlocked = error instanceof RootDevice.InterruptedScreen
+                || error instanceof BuilderRun.ScreenUnavailable;
+        if (control.epoch() != epoch) {
+            // Resume supersedes old observations, but a failed command may have sent input.
+            if (screenBlocked) error = null;
+            if (result != null && !result.finished()) result = null;
+        }
+        if (!current.verify && error != null && screenBlocked) {
+            suspend(error.getMessage());
+        } else if (error != null && !(error instanceof RunControl.Changed)) {
             Log.w("MarbleRunner", "Run stopped", error);
             endSession(error instanceof IOException ? error.getMessage() : "Unexpected runner error. Check logcat.", true);
             return;
         }
         if (result != null && result.finished()) {
-            Log.i("MarbleRunner", result.text());
+            Log.i("MarbleRunner", result.text().replace('\n', ' '));
+            if (!current.verify && result.goalReached()) postRunAlert("Goal reached", result.text());
             endSession(result.text(), false);
             return;
         }
@@ -670,11 +737,23 @@ public final class OverlayService extends Service {
         schedule(result != null ? result.delayMs() : 340);
     }
 
+    private void suspend(String message) {
+        Log.i("MarbleRunner", "Paused: " + message);
+        boolean wasHeld = held();
+        boolean alert = !paused && session != null && !session.verify;
+        paused = true;
+        detail = message;
+        updateHold(wasHeld);
+        if (alert) postRunAlert("Paused", message);
+        render();
+    }
+
     private void endSession(String message, boolean failed) {
+        if (session != null && !session.verify && failed) postRunAlert("Needs attention", message);
         clearSession();
         detail = message;
         warning = failed;
-        expanded = showSettings = expandAfterTick = false;
+        expanded = showHistory = expandAfterTick = dockAfterEdit = false;
         render();
     }
 
@@ -714,7 +793,7 @@ public final class OverlayService extends Service {
 
     @Override public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
-        if (session != null) endSession("Device configuration changed. Verify the game again.", true);
+        if (session != null) suspend("Return to Clash in landscape.");
         if (panel != null) panel.post(() -> {
             if (dockedLeft) dockUpperLeft();
             else clampPanel();
@@ -722,18 +801,30 @@ public final class OverlayService extends Service {
     }
 
     private Notification notification() {
-        Intent open = new Intent(this, MainActivity.class);
         Notification.Builder builder = new Notification.Builder(this, CHANNEL)
-                .setColor(Ui.LIME).setSmallIcon(R.drawable.ic_status).setContentTitle(
-                        session == null ? "Marble Runner" : (paused ? "Marble Runner · Paused" : "Marble Runner · Active"))
+                .setColor(Ui.LIME).setSmallIcon(R.drawable.ic_status).setContentTitle(getString(R.string.app_name)
+                        + (session == null ? "" : paused ? " · Paused" : " · Active"))
                 .setContentText(statusDetail()).setOnlyAlertOnce(true).setOngoing(true)
-                .setContentIntent(PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE));
+                .setContentIntent(openApp());
         if (session != null) {
             builder.addAction(new Notification.Action.Builder(null, paused ? "Resume" : "Pause",
                     notificationAction(TOGGLE)).build());
         }
         builder.addAction(new Notification.Action.Builder(null, "Stop & close", notificationAction(CLOSE)).build());
         return builder.build();
+    }
+
+    private void postRunAlert(String title, String message) {
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return;
+        notifications.notify(RUN_ALERT, new Notification.Builder(this, ALERT_CHANNEL)
+                .setColor(Ui.LIME).setSmallIcon(R.drawable.ic_status)
+                .setContentTitle(getString(R.string.app_name) + " · " + title)
+                .setContentText(message).setStyle(new Notification.BigTextStyle().bigText(message))
+                .setAutoCancel(true).setContentIntent(openApp()).build());
+    }
+
+    private PendingIntent openApp() {
+        return PendingIntent.getActivity(this, 0, new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE);
     }
 
     private PendingIntent notificationAction(String action) {
@@ -743,6 +834,7 @@ public final class OverlayService extends Service {
 
     @Override public void onDestroy() {
         clearSession();
+        worker.execute(journal::close);
         worker.shutdown();
         panelBounds = null;
         if (panel != null && panel.isAttachedToWindow()) windows.removeViewImmediate(panel);

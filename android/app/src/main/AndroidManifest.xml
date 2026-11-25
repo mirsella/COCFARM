@@ -12,7 +12,7 @@
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_marble"
-        android:label="Marble Runner"
+        android:label="@string/app_name"
         android:theme="@style/MarbleTheme">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

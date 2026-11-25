@@ -15,6 +15,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 final class RootDevice {
+    static final class InterruptedScreen extends IOException {
+        InterruptedScreen(String message) { super(message); }
+    }
+
     static final String GAME = "com.supercell.clashofclans";
     private static final int MAX_BYTES = 20 * 1024 * 1024;
     // Refuse ambiguous focus (including multiple focused displays), not mFocusedApp.
@@ -38,7 +42,7 @@ final class RootDevice {
         requireMarble();
         byte[] output = execute(() -> su("exec /system/bin/id -u"), 15);
         if (!"0".equals(new String(output, StandardCharsets.UTF_8).trim())) {
-            throw new IOException("KernelSU did not grant root to Marble Runner.");
+            throw new IOException("KernelSU did not grant root to COCFARM.");
         }
     }
 
@@ -58,7 +62,9 @@ final class RootDevice {
 
     byte[] capture() throws IOException {
         requireUnlocked();
-        return guarded(() -> su(FOCUS_GUARD + "exec /system/bin/screencap"));
+        byte[] capture = guarded(() -> su(FOCUS_GUARD + "/system/bin/screencap || exit 46\n" + FOCUS_GUARD));
+        requireUnlocked();
+        return capture;
     }
 
     void tap(int x, int y, RunControl control, int epoch) throws IOException {
@@ -77,7 +83,7 @@ final class RootDevice {
 
     private void requireUnlocked() throws IOException {
         if (!power.isInteractive() || keyguard.isKeyguardLocked()) {
-            throw new IOException("The phone is locked or its screen is off.");
+            throw new InterruptedScreen("Unlock the phone and return to Clash.");
         }
     }
 
@@ -111,7 +117,8 @@ final class RootDevice {
             new Thread(read, "marble-root-output").start();
             if (!process.waitFor(timeout, TimeUnit.SECONDS)) throw new IOException("Root command timed out.");
             int exit = process.exitValue();
-            if (exit == 42) throw new IOException("Clash of Clans isn't the focused window.");
+            if (exit == 42) throw new InterruptedScreen("Return to Clash of Clans.");
+            if (exit == 46) throw new IOException("Couldn't capture the game screen.");
             if (exit != 0) throw new IOException("Root command failed (" + exit + "). Check KernelSU.");
             return read.get(1, TimeUnit.SECONDS);
         } catch (InterruptedException e) {

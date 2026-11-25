@@ -55,10 +55,16 @@ final class Ui {
         button.setMinHeight(0);
         button.setMinWidth(0);
         button.setPadding(dp(context, 9), 0, dp(context, 9), 0);
-        button.setBackground(new RippleDrawable(ColorStateList.valueOf(primary ? 0x38000000 : 0x40d9f774),
-                surface(context, primary ? LIME : PANEL, primary ? 0 : EDGE, 5), null));
+        if (primary) primaryFill(button, LIME);
+        else button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x40d9f774),
+                surface(context, PANEL, EDGE, 5), null));
         button.setOnClickListener(action);
         return button;
+    }
+
+    static void primaryFill(Button button, int fill) {
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x38000000),
+                surface(button.getContext(), fill, 0, 5), null));
     }
 
     static LinearLayout stack(Context context) {
