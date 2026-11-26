@@ -108,6 +108,11 @@ army consistent, and run several blocks before drawing conclusions: the app
 doesn't control which opponents you get. OCR can also misread digits. For
 results that affect your conclusion, check the saved frames from a host run.
 
+Android backup and device transfer can include the app's private settings,
+battle history, and `files/window.xml` if you keep a UI dump there. COCFARM
+doesn't create that dump or read `/sdcard/window.xml`. A UI dump can contain
+text that was visible on the screen when it was captured.
+
 The app does not start on boot or resume input automatically after losing
 focus. A force-stop or process restart clears the active session; **Start**
 can still take over a live battle. It doesn't switch villages, touch upgrades
@@ -133,7 +138,7 @@ a signature mismatch unless you intend to erase its data.
 
 OpenCV and its license notice are bundled in the APK; screenshots are processed
 in memory. Battle result reading uses the bundled on-device ML Kit text
-recognizer. History is stored locally in the app, not uploaded.
+recognizer. COCFARM stores history in app data and doesn't upload it itself.
 
 ## Run from a computer over USB
 

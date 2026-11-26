@@ -10,7 +10,8 @@
         <package android:name="com.supercell.clashofclans" />
     </queries>
     <application
-        android:allowBackup="false"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/backup_rules"
         android:icon="@drawable/ic_marble"
         android:label="@string/app_name"
         android:theme="@style/MarbleTheme">
